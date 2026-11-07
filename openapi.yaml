@@ -1,0 +1,85 @@
+openapi: 3.1.0
+info:
+  title: Reply Intel API (working name)
+  version: "0.1.0"
+  description: Turns inbound email replies into structured JSON. Private beta; not deployed yet.
+servers:
+  - url: https://reply-intel.pages.dev
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, description: "API key: ri_live_ + 48 hex chars" }
+  schemas:
+    InboundEmail:
+      type: object
+      required: [from]
+      properties:
+        from: { type: string, example: "Jordan Lee <jordan@example.com>" }
+        to: { oneOf: [{ type: string }, { type: array, items: { type: string } }] }
+        subject: { type: string }
+        text: { type: string, description: "Plain-text body. One of text or html is required." }
+        html: { type: string }
+        message_id: { type: string, description: "RFC 5322 Message-ID; used for deduplication" }
+        in_reply_to: { type: string }
+        thread_id: { type: string }
+        headers: { type: object, additionalProperties: { type: string } }
+        date: { type: string, format: date-time }
+    ReplyEvent:
+      description: Full JSON Schema served at GET /v1/schema (draft 2020-12).
+      type: object
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, enum: [unauthorized, rate_limited, payload_too_large, invalid_json, invalid_email, idempotency_conflict, invalid_idempotency_key, quota_exceeded, invalid_signature, replay_detected, not_found, invalid_cursor, internal_error] }
+            message: { type: string }
+            request_id: { type: string }
+paths:
+  /health:
+    get: { security: [], summary: Health check, responses: { "200": { description: OK } } }
+  /v1/schema:
+    get: { security: [], summary: JSON Schema of ReplyEvent, responses: { "200": { description: Schema } } }
+  /v1/parse:
+    post:
+      summary: Classify one email
+      parameters:
+        - { in: header, name: Idempotency-Key, schema: { type: string, maxLength: 128 } }
+        - { in: query, name: include_text, schema: { type: boolean }, description: "Return the cleaned reply text (never stored)" }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/InboundEmail" } } } }
+      responses:
+        "200": { description: Event (processing.duplicate=true if Message-ID seen before), content: { application/json: { schema: { $ref: "#/components/schemas/ReplyEvent" } } } }
+        "400": { description: Invalid JSON, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { description: Bad key }
+        "402": { description: Monthly quota reached }
+        "413": { description: Body over 256 KB }
+        "422": { description: Validation error or idempotency conflict }
+        "429": { description: Rate limited (Retry-After) }
+  /v1/webhooks/inbound/{tenant_id}:
+    post:
+      security: []
+      summary: Provider inbound webhook (AgentMail, Resend, SES via adapter, or generic InboundEmail)
+      description: "Signed with Svix headers (svix-id, svix-timestamp, svix-signature) or X-Reply-Intel-Signature: t=<unix>,v1=<hex HMAC-SHA256 of 't.body'>. 5-minute tolerance; replays rejected."
+      parameters: [{ in: path, name: tenant_id, required: true, schema: { type: string } }]
+      responses: { "202": { description: Accepted }, "200": { description: Duplicate }, "401": { description: Bad signature }, "409": { description: Replay } }
+  /v1/events:
+    get:
+      summary: List events, newest first
+      parameters:
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { in: query, name: cursor, schema: { type: string } }
+      responses: { "200": { description: "{ data: ReplyEvent[], next_cursor: string|null }" } }
+  /v1/events/{id}:
+    get:
+      parameters: [{ in: path, name: id, required: true, schema: { type: string, pattern: "^evt_[0-9a-f]{24}$" } }]
+      responses: { "200": { description: Event }, "404": { description: Not found or another tenant's event } }
+  /v1/usage:
+    get: { summary: Usage this month, responses: { "200": { description: "{ month, plan, parsed, llm_calls, quota, remaining }" } } }
+  /v1/api-keys:
+    post:
+      summary: Create an API key for your own account (or, with X-Admin-Token, for a tenant — operator only)
+      responses: { "201": { description: "{ id, api_key } — key shown once" } }
+  /v1/api-keys/{id}:
+    delete: { summary: Revoke a key, parameters: [{ in: path, name: id, required: true, schema: { type: string } }], responses: { "200": { description: Revoked } } }
